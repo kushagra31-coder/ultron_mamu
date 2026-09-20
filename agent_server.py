@@ -6,11 +6,11 @@ import os
 import re
 import threading
 import time
-from typing import Any, Literal
+from typing import Any
 
 import ollama
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 from tools.loader import load_tools
@@ -292,11 +292,18 @@ def build_tool_context():
         names.append(fn.__name__)
         lines.append(f"- {fn.__name__}({', '.join(params)}): {doc}")
         
-    ToolNameLiteral = Literal[tuple(names)] if names else str
+    name_extra = {"enum": names} if names else None
 
     class ToolCall(BaseModel):
-        name: ToolNameLiteral
+        name: str = Field(..., json_schema_extra=name_extra)
         arguments: dict[str, Any]
+
+        @field_validator("name")
+        @classmethod
+        def validate_name(cls, v: str) -> str:
+            if names and v not in names:
+                raise ValueError(f"Unknown tool '{v}'. Expected one of: {names}")
+            return v
 
     class AgentResponse(BaseModel):
         calls: list[ToolCall]
