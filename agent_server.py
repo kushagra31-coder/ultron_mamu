@@ -311,6 +311,88 @@ def build_tool_context():
 
     return "\n".join(lines), AgentResponse.model_json_schema(), names, AgentResponse
 
+
+# --------------------------------------------------
+# Groq native-tool-calling planner helpers.
+# build_openai_tool_schemas() converts the same tool functions that
+# build_tool_context() introspects into the OpenAI-compatible schema
+# format Groq's API expects.
+# plan_via_groq() sends one planning turn to Groq and returns
+# (calls, direct_reply) in exactly the same shape the local planner
+# produces — or None on any failure so the caller can fall back.
+# --------------------------------------------------
+
+def build_openai_tool_schemas() -> list[dict]:
+    """Return OpenAI-compatible tool schemas for every registered tool function."""
+    schemas = []
+    for fn in all_functions():
+        sig = inspect.signature(fn)
+        properties: dict = {}
+        required: list[str] = []
+        for pname, p in sig.parameters.items():
+            ptype = p.annotation if p.annotation is not inspect.Parameter.empty else str
+            typename = _TYPE_MAP.get(ptype, "string")
+            properties[pname] = {"type": typename}
+            if p.default is inspect.Parameter.empty:
+                required.append(pname)
+        doc = (fn.__doc__ or "").strip().split("\n")[0] if fn.__doc__ else ""
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": fn.__name__,
+                "description": doc,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        })
+    return schemas
+
+
+GROQ_PLANNER_MODEL = os.getenv("GROQ_PLANNER_MODEL", "openai/gpt-oss-120b")
+
+def plan_via_groq(
+    messages: list[dict],
+    tool_schemas: list[dict],
+) -> "tuple[list, str] | None":
+    """Send one planning turn to Groq with native tool calling.
+
+    Returns (calls, direct_reply) where calls matches the shape
+    expected by the rest of the loop::
+
+        [{"function": {"name": ..., "arguments": {...}}}]
+
+    Returns None on any error so the caller can fall straight through
+    to the local planner without any behavior change.
+    """
+    if not GROQ_API_KEY:
+        return None
+    try:
+        groq = _GroqClient(api_key=GROQ_API_KEY)
+        completion = groq.chat.completions.create(
+            model=GROQ_PLANNER_MODEL,
+            messages=messages,
+            tools=tool_schemas if tool_schemas else None,
+            max_completion_tokens=512,
+            temperature=0.1,
+        )
+        msg = completion.choices[0].message
+        calls: list[dict] = []
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append({"function": {"name": tc.function.name, "arguments": args}})
+        direct_reply = (msg.content or "").strip()
+        return calls, direct_reply
+    except Exception as exc:
+        print(f"[groq-planner] fell back to local — {exc}")
+        return None
+
 def run_agent(text: str) -> str:
     global conversation
 
@@ -393,62 +475,79 @@ def run_agent(text: str) -> str:
                 ),
             }]
 
+            backend_used = "local"
+            calls, direct_reply = [], ""
             start = time.perf_counter()
 
-            response = c.chat(
-                model=MODEL,
-                messages=planner_messages,
-                stream=False,
-                think=False,
-                format=response_schema,
-                options={
-                    "temperature": 0.1,
-                    "num_predict": 384,
-                },
-                keep_alive="10m",
-            )
+            # ── TIER 1: Groq native-tool-calling planner (when enabled) ──
+            # Falls through to the local block on any failure — calls and
+            # direct_reply land in the same variables either way.
+            if TALK_BACKEND == "groq" and GROQ_API_KEY:
+                groq_msgs = conversation + [{
+                    "role": "system",
+                    "content": (
+                        "You are Ultron, a Windows voice assistant. Call tools to "
+                        "complete the user's request. Never narrate in text — only "
+                        "reply with text when no more tools are needed."
+                    ),
+                }]
+                groq_result = plan_via_groq(groq_msgs, build_openai_tool_schemas())
+                if groq_result is not None:
+                    calls, direct_reply = groq_result
+                    backend_used = "groq"
 
-            planner_time = time.perf_counter() - start
-            print(
-                f"[timing] planner step {step}: "
-                f"{planner_time:.2f}s"
-            )
+            # ── TIER 1 fallback: local structured-output planner ──
+            if backend_used == "local":
+                response = c.chat(
+                    model=MODEL,
+                    messages=planner_messages,
+                    stream=False,
+                    think=False,
+                    format=response_schema,
+                    options={
+                        "temperature": 0.1,
+                        "num_predict": 384,
+                    },
+                    keep_alive="10m",
+                )
 
-            msg = response.message
-            raw = (getattr(msg, "content", "") or "").strip()
+                msg = response.message
+                raw = (getattr(msg, "content", "") or "").strip()
 
-            print(
-                f"\n========== QWEN DEBUG (structured step {step}) =========="
-            )
-            print("RAW CONTENT:")
-            print(raw)
-            print("\nDONE REASON:")
-            print(getattr(response, "done_reason", None))
-            print("========================================================\n")
+                print(
+                    f"\n========== QWEN DEBUG (structured step {step}) =========="
+                )
+                print("RAW CONTENT:")
+                print(raw)
+                print("\nDONE REASON:")
+                print(getattr(response, "done_reason", None))
+                print("========================================================\n")
 
-            try:
-                parsed_model = AgentResponse.model_validate_json(raw) if raw else None
-                parsed = parsed_model.model_dump() if parsed_model else {}
-            except Exception as exc:
-                print(f"[validation warning] {exc}")
                 try:
-                    parsed = json.loads(raw) if raw else {}
-                except json.JSONDecodeError:
-                    parsed = {}
+                    parsed_model = AgentResponse.model_validate_json(raw) if raw else None
+                    parsed = parsed_model.model_dump() if parsed_model else {}
+                except Exception as exc:
+                    print(f"[validation warning] {exc}")
+                    try:
+                        parsed = json.loads(raw) if raw else {}
+                    except json.JSONDecodeError:
+                        parsed = {}
 
-            calls = [
-                {
-                    "function": {
-                        "name": item.get("name"),
-                        "arguments": item.get("arguments", {}),
+                calls = [
+                    {
+                        "function": {
+                            "name": item.get("name"),
+                            "arguments": item.get("arguments", {}),
+                        }
                     }
-                }
-                for item in parsed.get("calls", [])
-                if isinstance(item, dict)
-                and item.get("name") in tool_names
-            ]
+                    for item in parsed.get("calls", [])
+                    if isinstance(item, dict)
+                    and item.get("name") in tool_names
+                ]
 
-            direct_reply = (parsed.get("reply") or "").strip()
+                direct_reply = (parsed.get("reply") or "").strip()
+
+            print(f"[timing] planner step {step} ({backend_used}): {time.perf_counter() - start:.2f}s")
 
             # No more tools required. Preserve the model's short reply for
             # this completed turn; do not call another LLM unnecessarily.
