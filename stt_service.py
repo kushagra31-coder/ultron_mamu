@@ -12,13 +12,18 @@ import os
 import sys
 
 # --- Auto-fix: make the pip-installed cublas/cudnn DLLs discoverable ---
-# Avoids having to manually prepend them to PATH every session.
-_venv_root = sys.prefix
-_nvidia_base = os.path.join(_venv_root, "Lib", "site-packages", "nvidia")
-for _pkg in ("cublas", "cudnn"):
-    _bin_path = os.path.join(_nvidia_base, _pkg, "bin")
-    if os.path.isdir(_bin_path):
-        os.environ["PATH"] = _bin_path + os.pathsep + os.environ.get("PATH", "")
+# Only needed when STT runs on CUDA. Kept for users who opt back into
+# GPU transcription via ULTRON_STT_DEVICE=cuda.
+_STT_DEVICE_PRE = os.getenv("ULTRON_STT_DEVICE", "cpu").strip().lower()
+if _STT_DEVICE_PRE == "cuda":
+    _venv_root = sys.prefix
+    _nvidia_base = os.path.join(_venv_root, "Lib", "site-packages", "nvidia")
+    for _pkg in ("cublas", "cudnn"):
+        _bin_path = os.path.join(_nvidia_base, _pkg, "bin")
+        if os.path.isdir(_bin_path):
+            os.environ["PATH"] = _bin_path + os.pathsep + os.environ.get("PATH", "")
+    del _venv_root, _nvidia_base, _bin_path, _pkg
+del _STT_DEVICE_PRE
 # -------------------------------------------------------------------------
 
 import queue
@@ -34,10 +39,17 @@ from pynput import keyboard
 # ---------------- Config ----------------
 SAMPLE_RATE = 16000
 CHANNELS = 1
-# Using small model for fast loading, but with language="en" forced for accuracy
-MODEL_SIZE = "small"
-DEVICE = "cuda"
-COMPUTE_TYPE = "float16"
+# VRAM is reserved for the planner model, so STT runs on CPU. The "small"
+# model with int8 compute is comfortably fast on a modern CPU; set
+# ULTRON_STT_MODEL=medium for extra accuracy (disk is plentiful, CPU cost
+# is a little higher). float16 does not run on CPU in CTranslate2 — int8
+# is the recommended CPU compute type.
+MODEL_SIZE = os.getenv("ULTRON_STT_MODEL", "small")
+DEVICE = os.getenv("ULTRON_STT_DEVICE", "cpu").strip().lower()
+COMPUTE_TYPE = os.getenv(
+    "ULTRON_STT_COMPUTE_TYPE",
+    "int8" if DEVICE == "cpu" else "float16",
+)
 HOTKEY = {keyboard.Key.ctrl_l, keyboard.Key.alt_l, keyboard.Key.space}
 
 AGENT_ENDPOINT = "http://localhost:8000/speak"  # Step 3 agent server

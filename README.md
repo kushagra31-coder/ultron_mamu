@@ -5,16 +5,21 @@ A voice-controlled Windows assistant that runs almost entirely on your own hardw
 ## Architecture
 
 ```
-Mic → faster-whisper (local STT)
-  → [optional] Groq intent router — "chat" or "action"?
-      ├─ chat → answered directly by Groq
-      └─ action → Qwen3.5:4b (local, Ollama) — structured-output planner
+Mic → faster-whisper on CPU (local STT; VRAM stays free for the planner)
+  → local two-tier router (qwen3.5:4b, on-device — no network call)
+      ├─ chat    → answered directly by the fast tier, no planning loop
+      ├─ simple  → fast tier plans (≤8 steps), escalates to 8B on failure
+      └─ complex → qwen3:8b (local, Ollama) — structured-output planner
           → executes tools, loops until done
-          → spoken reply (Groq if enabled, else local)
-          → pyttsx3/SAPI (local TTS)
+          → spoken reply via Kokoro-ONNX (local neural TTS, CPU)
 ```
 
 Everything works fully offline by default. Groq is strictly opt-in (`ULTRON_TALK_BACKEND=groq`) — see [Privacy](#privacy) below for exactly what that changes.
+
+**VRAM budget (4–8 GB):** STT, TTS, wake word, and embeddings all run on CPU.
+Only the planner touches the GPU. `qwen3:8b` at Q4_K_M needs ~5 GB; on a
+4 GB card set `ULTRON_MODEL=qwen3:4b` to stay in the 4B class. Ollama loads
+the fast tier and the 8B tier on demand, so both can share the card.
 
 ## How tool calling actually works
 
@@ -35,7 +40,9 @@ This project intentionally uses **64-bit Python 3.11** — the pinned NumPy buil
 
 The script also:
 - Verifies Ollama is reachable
-- Verifies `qwen3.5:4b` (the default `ULTRON_MODEL`) is pulled
+- Verifies `qwen3:8b` (the default `ULTRON_MODEL`) and `qwen3.5:4b`
+  (the default `ULTRON_FAST_MODEL`) are pulled — `ollama pull qwen3:8b`
+  if you set it up manually
 - Verifies Python packages and dynamic tool discovery
 
 ## Run
@@ -96,6 +103,54 @@ Leave `ULTRON_TALK_BACKEND` unset (default `local`) and none of this activates �
 - **chat-classified requests** are answered entirely by Groq (`GROQ_MODEL`, default `openai/gpt-oss-20b`) — the local model is never invoked for these.
 - **action-classified requests** run the full local planner as normal; only the final one-sentence spoken confirmation goes through Groq instead of the local model, if enabled.
 - Classification defaults to action (full local pipeline) on any failure — bad key, network error, rate limit — so a request is never silently dropped.
+
+## Configuration reference
+
+| Variable | Default | What it does |
+|---|---|---|
+| `ULTRON_MODEL` | `qwen3:8b` | Tier-2 planner for complex multi-step tasks. On 4 GB VRAM use `qwen3:4b`. |
+| `ULTRON_FAST_MODEL` | `qwen3.5:4b` | Tier-1: routing, chat replies, simple commands. |
+| `ULTRON_ROUTER` | `local` | Two-tier routing. Set to `off` for single-model legacy behavior. |
+| `ULTRON_FAST_MAX_STEPS` | `8` | Step budget for the fast tier before escalating to 8B. |
+| `ULTRON_MAX_STEPS` | `30` | Step budget for the 8B planner. |
+| `ULTRON_STT_MODEL` | `small` | faster-whisper model (CPU). `medium` is more accurate; disk is cheap. |
+| `ULTRON_STT_DEVICE` | `cpu` | Set to `cuda` to move STT back to the GPU. |
+| `ULTRON_HA_URL` | `http://homeassistant.local:8123` | Home Assistant base URL. |
+| `ULTRON_HA_TOKEN` | (unset) | HA long-lived access token (Profile → Long-lived access tokens). |
+| `ULTRON_NUDGE_WINDOW_MIN` | `30` | How far ahead reminder nudges look. |
+| `ULTRON_TALK_BACKEND` | `local` | Set to `groq` for the opt-in cloud backend. |
+
+## Proactive briefings
+
+Ultron can brief you without being asked, via Windows Task Scheduler:
+
+```powershell
+.\setup_briefings.ps1
+```
+
+This registers two per-user tasks: a spoken **morning briefing** (8 AM daily —
+date/time, weather, today's reminders) and **reminder nudges** (every
+30 min, 8 AM–8 PM, silent when nothing is due). Manage reminders in
+`~/.ultron/reminders.json`:
+
+```json
+[{"text": "Standup meeting", "time": "10:00"}]
+```
+
+The agent can also brief on demand: ask "what's my day look like?" and the
+`get_morning_briefing` tool answers from the same source.
+
+## Home Assistant
+
+Free, local smart-home control — no cloud, no subscription:
+
+```powershell
+$env:ULTRON_HA_URL="http://homeassistant.local:8123"
+$env:ULTRON_HA_TOKEN="your-long-lived-token"
+```
+
+Then "turn off the living room lights" just works: `ha_list_entities`
+discovers names, `ha_get_state` reads them, `ha_call_service` controls them.
 
 ## Privacy
 

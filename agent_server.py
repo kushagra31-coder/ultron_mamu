@@ -23,7 +23,10 @@ except Exception as exc:
     print(f"[memory] import failed — long-term memory disabled: {exc}")
     get_store = None
 
-MODEL=os.getenv("ULTRON_MODEL","qwen3.5:4b")
+MODEL=os.getenv("ULTRON_MODEL","qwen3:8b")              # TIER 2: big-brain planner for complex multi-step tasks
+FAST_MODEL=os.getenv("ULTRON_FAST_MODEL","qwen3.5:4b")  # TIER 1: fast local tier — routing, chat, simple commands
+FAST_MAX_STEPS=max(1,int(os.getenv("ULTRON_FAST_MAX_STEPS","8")))
+ROUTER_MODE=os.getenv("ULTRON_ROUTER","local").strip().lower()  # "local" (two-tier) | "off" (everything on MODEL)
 OLLAMA_HOST=os.getenv("OLLAMA_HOST","http://127.0.0.1:11434")
 MAX_HISTORY=max(4,int(os.getenv("ULTRON_MAX_HISTORY","30")))
 MAX_STEPS=max(1,int(os.getenv("ULTRON_MAX_STEPS","30")))
@@ -149,6 +152,96 @@ def handle_chat_via_groq(text: str) -> str:
         return reply
     # Groq unavailable — fall through to full local pipeline silently
     print("[intent] chat path fell back to local pipeline")
+
+
+# --------------------------------------------------
+# Local two-tier router — fast 4B tier + 8B planner tier.
+# Fully on-device: no network call, no per-utterance latency.
+# Routes every request to 'chat' | 'simple' | 'complex':
+#   chat    -> FAST_MODEL answers directly (no tools, no planning loop)
+#   simple  -> FAST_MODEL plans with a small step budget, escalates on failure
+#   complex -> MODEL (8B) plans with the full step budget
+# Set ULTRON_ROUTER=off to send everything to MODEL (legacy behavior).
+# --------------------------------------------------
+_ROUTER_SYSTEM = (
+    "You are a fast request router for a Windows voice assistant. "
+    "Reply with exactly one word: 'chat', 'simple', or 'complex'. "
+    "No punctuation, no explanation.\n\n"
+    "Reply 'chat' for pure conversation or static knowledge: greetings, "
+    "small talk, jokes, stories, definitions, explanations, opinions, "
+    "mental arithmetic.\n\n"
+    "Reply 'simple' for ONE quick computer action: open an app or website, "
+    "web search, play a song, current time/date/weather, screenshot, "
+    "a short calculation using a tool, one smart-home command.\n\n"
+    "Reply 'complex' when the request needs MULTIPLE steps, judgment, or "
+    "chaining: research-then-summarize, organize files, multi-app GUI "
+    "workflows, conditional logic ('if X then Y'), anything ambiguous "
+    "that needs a real plan.\n\n"
+    "When torn between 'simple' and 'complex', reply 'simple'."
+)
+
+def classify_local(text: str) -> str:
+    """Route to 'chat' | 'simple' | 'complex' using the fast local tier.
+    Defaults to 'complex' (full pipeline) on any failure."""
+    try:
+        resp = client().chat(
+            model=FAST_MODEL,
+            messages=[
+                {"role": "system", "content": _ROUTER_SYSTEM},
+                {"role": "user", "content": text},
+            ],
+            stream=False,
+            think=False,
+            options={"temperature": 0.0, "num_predict": 8},
+            keep_alive="10m",
+        )
+        word = (resp.message.content or "").strip().lower()
+        if word.startswith("chat"):
+            route = "chat"
+        elif word.startswith("complex"):
+            route = "complex"
+        else:
+            route = "simple"
+        print(f"[router] {FAST_MODEL} -> {route} (raw: {word!r})")
+        return route
+    except Exception as exc:
+        print(f"[router] classifier error - defaulting to complex: {exc}")
+        return "complex"
+
+
+def chat_reply_local(text: str) -> str:
+    """Answer pure conversation directly with the fast tier (no tools)."""
+    global conversation
+    try:
+        resp = client().chat(
+            model=FAST_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Ultron, a sharp and concise voice assistant. "
+                        "Answer in one or two short spoken sentences. "
+                        "Do not mention tools, JSON, or internal reasoning."
+                    ),
+                },
+                *conversation[-6:],
+                {"role": "user", "content": text},
+            ],
+            stream=False,
+            think=False,
+            options={"temperature": 0.4, "num_predict": 120},
+            keep_alive="10m",
+        )
+        reply = (resp.message.content or "").strip()
+    except Exception as exc:
+        print(f"[router] chat reply failed: {exc}")
+        reply = ""
+    with lock:
+        conversation.append({"role": "user", "content": text})
+        conversation = [conversation[0], *conversation[1:][-MAX_HISTORY:]]
+        conversation.append({"role": "assistant", "content": reply or "(no reply)"})
+    # NOTE: the /speak endpoint speaks the returned reply; do not speak here.
+    return reply or "I'm not sure what to say to that."
     return ""  # empty string signals caller to run full pipeline
 SYSTEM_PROMPT = f"""You are ULTRON, a local Windows voice assistant.
 Your home directory is {os.path.expanduser("~")}. When using absolute paths, use this directory.
@@ -403,11 +496,350 @@ def plan_via_groq(
         print(f"[groq-planner] fell back to local — {exc}")
         return None
 
+def _append_user_turn(text: str) -> None:
+    """Append the user message and trim history. Call with lock held."""
+    global conversation
+    conversation.append({"role": "user", "content": text})
+    conversation = [conversation[0], *conversation[1:][-MAX_HISTORY:]]
+
+
+def _plan_loop(text: str, model: str, max_steps: int, memory_context: str = "") -> tuple[str, bool]:
+    """Run the structured-output plan→execute loop on one model tier.
+
+    Returns (reply, resolved). resolved=False means the tier gave up
+    (step budget exhausted, or no executable tool call), so the caller
+    may escalate to a stronger tier. Shares the global conversation, so
+    an escalated tier sees what the fast tier already tried.
+    """
+    global conversation
+    c = client()
+    tool_listing, response_schema, tool_names, AgentResponse = build_tool_context()
+
+    last_direct_reply = ""
+    all_results: list[str] = []
+    completed_action_keys: set[str] = set()   # all successfully-executed action keys
+    # These tools are safe to call multiple times — never block them
+    _ALLOW_REPEAT_TOOLS = {"wait", "focus_window"}
+    action_history: list[str] = []
+    
+    # Track consecutive duplicates to break loops
+    last_action_key_str = ""
+    consecutive_action_count = 0
+
+    # --------------------------------------------------
+    # Multi-step planner/executor loop.
+    #
+    # One planner turn may launch an application. The next
+    # planner turn sees that result and can continue with
+    # wait -> focus -> mouse/keyboard -> verification.
+    # --------------------------------------------------
+    for step in range(1, max_steps + 1):
+        completed_actions = "; ".join(action_history) or "none"
+        last_action_display = action_history[-1] if action_history else "none"
+
+        planner_messages = conversation + [{
+            "role": "system",
+            "content": (
+                "Available tools (call by exact name; arguments is an object "
+                "with exactly the parameters listed):\n" + tool_listing +
+                "\n\nRespond with the required JSON only. Put any tool calls "
+                "needed right now in \"calls\" (empty list if none are needed "
+                "this turn). Put your short spoken reply in \"reply\" ONLY "
+                "when no calls are needed. Never explain your plan in reply "
+                "or anywhere else — just call the tools. "
+                "Continue the user's task until every requested action is "
+                "completed. After a tool succeeds, decide whether another "
+                "tool is still required before replying. "
+                "Never repeat the same successful action with the same arguments. "
+                "Do NOT call `wait` consecutively more than twice. If you need "
+                "more time, use a larger number of seconds. After waiting, ALWAYS "
+                "proceed to the next logical action (like focus_window or type_text). "
+                "If text was just typed into a GUI and the user asked to "
+                "calculate, submit, search, send, or otherwise confirm it, "
+                "do NOT call type_text again. You MUST use press_key with 'enter' "
+                "or '=' to submit it, followed by a wait and then capture_screen "
+                "(or read_calculator_display if in Calculator) to read the result. "
+                "IMPORTANT: If COMPLETED ACTIONS already contains an observation result "
+                "(like capture_screen or read_calculator_display), you have your observation. "
+                "Set calls=[] and put your spoken reply in 'reply' RIGHT NOW. "
+                "Do NOT call capture_screen or read_calculator_display again. "
+                "Use the execution state below to choose the next action. "
+                f"\n\nCURRENT TASK: {text}\n"
+                f"COMPLETED ACTIONS: {completed_actions}\n"
+                f"LAST ACTION: {last_action_display}"
+                + (f"\n\n{memory_context}" if memory_context else "")
+            ),
+        }]
+
+        backend_used = "local"
+        calls, direct_reply = [], ""
+        start = time.perf_counter()
+
+        # ── TIER 1: Groq native-tool-calling planner (when enabled) ──
+        # Falls through to the local block on any failure — calls and
+        # direct_reply land in the same variables either way.
+        if TALK_BACKEND == "groq" and GROQ_API_KEY:
+            groq_msgs = conversation + [{
+                "role": "system",
+                "content": (
+                    "You are Ultron, a Windows voice assistant. Call tools to "
+                    "complete the user's request. Never narrate in text — only "
+                    "reply with text when no more tools are needed."
+                ),
+            }]
+            groq_result = plan_via_groq(groq_msgs, build_openai_tool_schemas())
+            if groq_result is not None:
+                calls, direct_reply = groq_result
+                backend_used = "groq"
+
+        # ── TIER 1 fallback: local structured-output planner ──
+        if backend_used == "local":
+            response = c.chat(
+                model=model,
+                messages=planner_messages,
+                stream=False,
+                think=False,
+                format=response_schema,
+                options={
+                    "temperature": 0.1,
+                    "num_predict": 384,
+                },
+                keep_alive="10m",
+            )
+
+            msg = response.message
+            raw = (getattr(msg, "content", "") or "").strip()
+
+            print(
+                f"\n========== QWEN DEBUG (structured step {step}) =========="
+            )
+            print("RAW CONTENT:")
+            print(raw)
+            print("\nDONE REASON:")
+            print(getattr(response, "done_reason", None))
+            print("========================================================\n")
+
+            try:
+                parsed_model = AgentResponse.model_validate_json(raw) if raw else None
+                parsed = parsed_model.model_dump() if parsed_model else {}
+            except Exception as exc:
+                print(f"[validation warning] {exc}")
+                try:
+                    parsed = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    parsed = {}
+
+            calls = [
+                {
+                    "function": {
+                        "name": item.get("name"),
+                        "arguments": item.get("arguments", {}),
+                    }
+                }
+                for item in parsed.get("calls", [])
+                if isinstance(item, dict)
+                and item.get("name") in tool_names
+            ]
+
+            direct_reply = (parsed.get("reply") or "").strip()
+
+        print(f"[timing] planner step {step} ({backend_used}): {time.perf_counter() - start:.2f}s")
+
+        # No more tools required. Preserve the model's short reply for
+        # this completed turn; do not call another LLM unnecessarily.
+        if not calls:
+            last_direct_reply = direct_reply
+
+            conversation.append({
+                "role": "assistant",
+                "content": direct_reply or "(task completed)",
+            })
+
+            if all_results:
+                if direct_reply:
+                    return direct_reply, True
+
+                # Fall back to a compact final response only when the
+                # planner finished without supplying one.
+                final_context = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Ultron. Give ONE short spoken sentence "
+                            "confirming the completed user request. Do not "
+                            "reason, narrate, output JSON, or mention tools."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Original request: {text}\n\n"
+                            f"Tool results:\n"
+                            + "\n".join(all_results)
+                        ),
+                    },
+                ]
+
+                final_start = time.perf_counter()
+                reply = ""
+                backend_tag = "local"
+
+                # ── STEP 2: try Groq first, fall back to local ──
+                if TALK_BACKEND == "groq":
+                    groq_reply = talk_via_groq(final_context)
+                    if groq_reply:
+                        reply = groq_reply
+                        backend_tag = "groq"
+
+                if not reply:
+                    # Local fallback (always runs when Groq is off or fails)
+                    final_response = c.chat(
+                        model=model,
+                        messages=final_context,
+                        tools=[],
+                        stream=False,
+                        think=False,
+                        options={
+                            "temperature": 0.2,
+                            "num_predict": 64,
+                        },
+                        keep_alive="10m",
+                    )
+                    reply = (
+                        getattr(final_response.message, "content", "") or ""
+                    ).strip()
+
+                print(
+                    f"[timing] final response ({backend_tag}): "
+                    f"{time.perf_counter() - final_start:.2f}s"
+                )
+
+                return (reply
+                    or "The requested action was completed."), True
+
+            if direct_reply:
+                return direct_reply, True
+
+            return ("I couldn't execute that command because "
+                "the model did not return an executable tool call."), False
+
+        # --------------------------------------------------
+        # Execute every tool requested on this planning turn.
+        # Repeated identical actions are blocked so a confused planner
+        # cannot type the same text indefinitely. The rejection is fed
+        # back into the next planning turn so the model must choose a
+        # different next action.
+        # --------------------------------------------------
+        
+        # Speak intermediate thoughts if the agent provided them while calling tools
+        if direct_reply:
+            speak_async(direct_reply)
+            
+        conversation.append({
+            "role": "assistant",
+            "content": (
+                "[executing tools: "
+                + ", ".join(
+                    call["function"]["name"]
+                    for call in calls
+                )
+                + "]"
+            ),
+        })
+
+        for call in calls:
+            name = call["function"]["name"]
+            arguments = call["function"].get("arguments", {})
+            try:
+                action_key = f"{name}:{json.dumps(arguments, sort_keys=True, default=str)}"
+            except TypeError:
+                action_key = f"{name}:{arguments}"
+
+            tool_start = time.perf_counter()
+
+            if action_key == last_action_key_str:
+                consecutive_action_count += 1
+            else:
+                last_action_key_str = action_key
+                consecutive_action_count = 1
+
+            if consecutive_action_count > 2:
+                result = f"ERROR: You have called {name} too many times consecutively. Stop repeating this action and try something else."
+                print(f"[tool] {name}: REJECTED (consecutive limit)")
+                action_history.append(f"{name} [consecutive limit reached]")
+                
+            elif action_key in completed_action_keys:
+                result = (
+                    f"REJECTED: {name}({arguments}) is already done — "
+                    "it appears in COMPLETED ACTIONS. "
+                    "Do NOT call it again. Read COMPLETED ACTIONS and "
+                    "choose the NEXT step of the task."
+                )
+                print(f"[tool] {name}: REJECTED (already completed)")
+                print(
+                    f"[timing] {name}: "
+                    f"{time.perf_counter() - tool_start:.2f}s"
+                )
+                action_history.append(f"{name} [already done]")
+                
+            else:
+                result = execute(call)
+                print(f"[tool] {name}: {result}")
+                
+                print(
+                    f"[timing] {name}: "
+                    f"{time.perf_counter() - tool_start:.2f}s"
+                )
+                # Track successful actions so the planner can't repeat them.
+                # _is_error: don't mark failed tool calls as "done" so retries work.
+                # _ALLOW_REPEAT_TOOLS: wait/focus_window may be called multiple times.
+                _is_error = (
+                    not result
+                    or "failed" in result.lower()
+                    or "fail-safe" in result.lower()
+                    or "could not" in result.lower()
+                    or "error" in result.lower()
+                    or "returned no description" in result.lower()
+                    or result.startswith("Tool '")
+                    or result.startswith("Unknown tool")
+                    or result.startswith("Screen vision failed")
+                    or result.startswith("Vision model")
+                    or result.startswith("REJECTED")
+                    or "access denied" in result.lower()
+                )
+                if not _is_error and name not in _ALLOW_REPEAT_TOOLS:
+                    completed_action_keys.add(action_key)
+                action_history.append(f"{name}({arguments}) -> {result}")
+
+            all_results.append(f"{name}: {result}")
+
+            # Feed the result back into the next planner turn.
+            conversation.append({
+                "role": "tool",
+                "tool_name": name,
+                "content": result,
+            })
+
+    # MAX_STEPS was reached without the planner declaring completion.
+    # Never claim success in that situation.
+    return ("I couldn't complete the entire command within the action limit."), False
+
+
+
 def run_agent(text: str) -> str:
     global conversation
 
-    # ── TIER 0: Intent router — runs before the local model is touched ──
-    # classify_intent() sends text to Groq; defaults to "action" on any failure.
+    # Long-term memory: semantic recall of facts + past episodes.
+    # Recalled once per turn and shared by both planner tiers.
+    memory_context = ""
+    if get_store is not None:
+        try:
+            memory_context = get_store().recall_block(text)
+        except Exception as exc:
+            print(f"[memory] recall failed: {exc}")
+
+    # ── TIER 0: Intent router — runs before any planning ──
+    # The Groq path is strictly opt-in (ULTRON_TALK_BACKEND=groq).
     if TALK_BACKEND == "groq" and GROQ_API_KEY:
         intent = classify_intent(text)
         if intent == "chat":
@@ -415,344 +847,27 @@ def run_agent(text: str) -> str:
             if reply:  # non-empty means Groq answered successfully
                 return reply
             # empty reply = Groq failed mid-request; fall through to local pipeline
+        with lock:
+            _append_user_turn(text)
+            reply, _ = _plan_loop(text, MODEL, MAX_STEPS, memory_context)
+            return reply
 
+    # ── Local two-tier router: fast 4B tier + 8B planner tier ──
+    # chat    -> FAST_MODEL answers directly, no tools, no planning loop.
+    # simple  -> FAST_MODEL plans with a small step budget, escalates on failure.
+    # complex -> MODEL (8B) plans with the full step budget.
+    route = classify_local(text) if ROUTER_MODE == "local" else "complex"
+    if route == "chat":
+        return chat_reply_local(text)
     with lock:
-        conversation.append({
-            "role": "user",
-            "content": text,
-        })
-
-        conversation = [
-            conversation[0],
-            *conversation[1:][-MAX_HISTORY:]
-        ]
-
-        c = client()
-        tool_listing, response_schema, tool_names, AgentResponse = build_tool_context()
-
-        last_direct_reply = ""
-        all_results: list[str] = []
-        completed_action_keys: set[str] = set()   # all successfully-executed action keys
-        # These tools are safe to call multiple times — never block them
-        _ALLOW_REPEAT_TOOLS = {"wait", "focus_window"}
-        action_history: list[str] = []
-        
-        # Track consecutive duplicates to break loops
-        last_action_key_str = ""
-        consecutive_action_count = 0
-
-        # Long-term memory: semantic recall of facts + past episodes,
-        # injected into every planning turn below.
-        memory_context = ""
-        if get_store is not None:
-            try:
-                memory_context = get_store().recall_block(text)
-            except Exception as exc:
-                print(f"[memory] recall failed: {exc}")
-
-        # --------------------------------------------------
-        # Multi-step planner/executor loop.
-        #
-        # One planner turn may launch an application. The next
-        # planner turn sees that result and can continue with
-        # wait -> focus -> mouse/keyboard -> verification.
-        # --------------------------------------------------
-        for step in range(1, MAX_STEPS + 1):
-            completed_actions = "; ".join(action_history) or "none"
-            last_action_display = action_history[-1] if action_history else "none"
-
-            planner_messages = conversation + [{
-                "role": "system",
-                "content": (
-                    "Available tools (call by exact name; arguments is an object "
-                    "with exactly the parameters listed):\n" + tool_listing +
-                    "\n\nRespond with the required JSON only. Put any tool calls "
-                    "needed right now in \"calls\" (empty list if none are needed "
-                    "this turn). Put your short spoken reply in \"reply\" ONLY "
-                    "when no calls are needed. Never explain your plan in reply "
-                    "or anywhere else — just call the tools. "
-                    "Continue the user's task until every requested action is "
-                    "completed. After a tool succeeds, decide whether another "
-                    "tool is still required before replying. "
-                    "Never repeat the same successful action with the same arguments. "
-                    "Do NOT call `wait` consecutively more than twice. If you need "
-                    "more time, use a larger number of seconds. After waiting, ALWAYS "
-                    "proceed to the next logical action (like focus_window or type_text). "
-                    "If text was just typed into a GUI and the user asked to "
-                    "calculate, submit, search, send, or otherwise confirm it, "
-                    "do NOT call type_text again. You MUST use press_key with 'enter' "
-                    "or '=' to submit it, followed by a wait and then capture_screen "
-                    "(or read_calculator_display if in Calculator) to read the result. "
-                    "IMPORTANT: If COMPLETED ACTIONS already contains an observation result "
-                    "(like capture_screen or read_calculator_display), you have your observation. "
-                    "Set calls=[] and put your spoken reply in 'reply' RIGHT NOW. "
-                    "Do NOT call capture_screen or read_calculator_display again. "
-                    "Use the execution state below to choose the next action. "
-                    f"\n\nCURRENT TASK: {text}\n"
-                    f"COMPLETED ACTIONS: {completed_actions}\n"
-                    f"LAST ACTION: {last_action_display}"
-                    + (f"\n\n{memory_context}" if memory_context else "")
-                ),
-            }]
-
-            backend_used = "local"
-            calls, direct_reply = [], ""
-            start = time.perf_counter()
-
-            # ── TIER 1: Groq native-tool-calling planner (when enabled) ──
-            # Falls through to the local block on any failure — calls and
-            # direct_reply land in the same variables either way.
-            if TALK_BACKEND == "groq" and GROQ_API_KEY:
-                groq_msgs = conversation + [{
-                    "role": "system",
-                    "content": (
-                        "You are Ultron, a Windows voice assistant. Call tools to "
-                        "complete the user's request. Never narrate in text — only "
-                        "reply with text when no more tools are needed."
-                    ),
-                }]
-                groq_result = plan_via_groq(groq_msgs, build_openai_tool_schemas())
-                if groq_result is not None:
-                    calls, direct_reply = groq_result
-                    backend_used = "groq"
-
-            # ── TIER 1 fallback: local structured-output planner ──
-            if backend_used == "local":
-                response = c.chat(
-                    model=MODEL,
-                    messages=planner_messages,
-                    stream=False,
-                    think=False,
-                    format=response_schema,
-                    options={
-                        "temperature": 0.1,
-                        "num_predict": 384,
-                    },
-                    keep_alive="10m",
-                )
-
-                msg = response.message
-                raw = (getattr(msg, "content", "") or "").strip()
-
-                print(
-                    f"\n========== QWEN DEBUG (structured step {step}) =========="
-                )
-                print("RAW CONTENT:")
-                print(raw)
-                print("\nDONE REASON:")
-                print(getattr(response, "done_reason", None))
-                print("========================================================\n")
-
-                try:
-                    parsed_model = AgentResponse.model_validate_json(raw) if raw else None
-                    parsed = parsed_model.model_dump() if parsed_model else {}
-                except Exception as exc:
-                    print(f"[validation warning] {exc}")
-                    try:
-                        parsed = json.loads(raw) if raw else {}
-                    except json.JSONDecodeError:
-                        parsed = {}
-
-                calls = [
-                    {
-                        "function": {
-                            "name": item.get("name"),
-                            "arguments": item.get("arguments", {}),
-                        }
-                    }
-                    for item in parsed.get("calls", [])
-                    if isinstance(item, dict)
-                    and item.get("name") in tool_names
-                ]
-
-                direct_reply = (parsed.get("reply") or "").strip()
-
-            print(f"[timing] planner step {step} ({backend_used}): {time.perf_counter() - start:.2f}s")
-
-            # No more tools required. Preserve the model's short reply for
-            # this completed turn; do not call another LLM unnecessarily.
-            if not calls:
-                last_direct_reply = direct_reply
-
-                conversation.append({
-                    "role": "assistant",
-                    "content": direct_reply or "(task completed)",
-                })
-
-                if all_results:
-                    if direct_reply:
-                        return direct_reply
-
-                    # Fall back to a compact final response only when the
-                    # planner finished without supplying one.
-                    final_context = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are Ultron. Give ONE short spoken sentence "
-                                "confirming the completed user request. Do not "
-                                "reason, narrate, output JSON, or mention tools."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Original request: {text}\n\n"
-                                f"Tool results:\n"
-                                + "\n".join(all_results)
-                            ),
-                        },
-                    ]
-
-                    final_start = time.perf_counter()
-                    reply = ""
-                    backend_tag = "local"
-
-                    # ── STEP 2: try Groq first, fall back to local ──
-                    if TALK_BACKEND == "groq":
-                        groq_reply = talk_via_groq(final_context)
-                        if groq_reply:
-                            reply = groq_reply
-                            backend_tag = "groq"
-
-                    if not reply:
-                        # Local fallback (always runs when Groq is off or fails)
-                        final_response = c.chat(
-                            model=MODEL,
-                            messages=final_context,
-                            tools=[],
-                            stream=False,
-                            think=False,
-                            options={
-                                "temperature": 0.2,
-                                "num_predict": 64,
-                            },
-                            keep_alive="10m",
-                        )
-                        reply = (
-                            getattr(final_response.message, "content", "") or ""
-                        ).strip()
-
-                    print(
-                        f"[timing] final response ({backend_tag}): "
-                        f"{time.perf_counter() - final_start:.2f}s"
-                    )
-
-                    return (
-                        reply
-                        or "The requested action was completed."
-                    )
-
-                if direct_reply:
-                    return direct_reply
-
-                return (
-                    "I couldn't execute that command because "
-                    "the model did not return an executable tool call."
-                )
-
-            # --------------------------------------------------
-            # Execute every tool requested on this planning turn.
-            # Repeated identical actions are blocked so a confused planner
-            # cannot type the same text indefinitely. The rejection is fed
-            # back into the next planning turn so the model must choose a
-            # different next action.
-            # --------------------------------------------------
-            
-            # Speak intermediate thoughts if the agent provided them while calling tools
-            if direct_reply:
-                speak_async(direct_reply)
-                
-            conversation.append({
-                "role": "assistant",
-                "content": (
-                    "[executing tools: "
-                    + ", ".join(
-                        call["function"]["name"]
-                        for call in calls
-                    )
-                    + "]"
-                ),
-            })
-
-            for call in calls:
-                name = call["function"]["name"]
-                arguments = call["function"].get("arguments", {})
-                try:
-                    action_key = f"{name}:{json.dumps(arguments, sort_keys=True, default=str)}"
-                except TypeError:
-                    action_key = f"{name}:{arguments}"
-
-                tool_start = time.perf_counter()
-
-                if action_key == last_action_key_str:
-                    consecutive_action_count += 1
-                else:
-                    last_action_key_str = action_key
-                    consecutive_action_count = 1
-
-                if consecutive_action_count > 2:
-                    result = f"ERROR: You have called {name} too many times consecutively. Stop repeating this action and try something else."
-                    print(f"[tool] {name}: REJECTED (consecutive limit)")
-                    action_history.append(f"{name} [consecutive limit reached]")
-                    
-                elif action_key in completed_action_keys:
-                    result = (
-                        f"REJECTED: {name}({arguments}) is already done — "
-                        "it appears in COMPLETED ACTIONS. "
-                        "Do NOT call it again. Read COMPLETED ACTIONS and "
-                        "choose the NEXT step of the task."
-                    )
-                    print(f"[tool] {name}: REJECTED (already completed)")
-                    print(
-                        f"[timing] {name}: "
-                        f"{time.perf_counter() - tool_start:.2f}s"
-                    )
-                    action_history.append(f"{name} [already done]")
-                    
-                else:
-                    result = execute(call)
-                    print(f"[tool] {name}: {result}")
-                    
-                    print(
-                        f"[timing] {name}: "
-                        f"{time.perf_counter() - tool_start:.2f}s"
-                    )
-                    # Track successful actions so the planner can't repeat them.
-                    # _is_error: don't mark failed tool calls as "done" so retries work.
-                    # _ALLOW_REPEAT_TOOLS: wait/focus_window may be called multiple times.
-                    _is_error = (
-                        not result
-                        or "failed" in result.lower()
-                        or "fail-safe" in result.lower()
-                        or "could not" in result.lower()
-                        or "error" in result.lower()
-                        or "returned no description" in result.lower()
-                        or result.startswith("Tool '")
-                        or result.startswith("Unknown tool")
-                        or result.startswith("Screen vision failed")
-                        or result.startswith("Vision model")
-                        or result.startswith("REJECTED")
-                        or "access denied" in result.lower()
-                    )
-                    if not _is_error and name not in _ALLOW_REPEAT_TOOLS:
-                        completed_action_keys.add(action_key)
-                    action_history.append(f"{name}({arguments}) -> {result}")
-
-                all_results.append(f"{name}: {result}")
-
-                # Feed the result back into the next planner turn.
-                conversation.append({
-                    "role": "tool",
-                    "tool_name": name,
-                    "content": result,
-                })
-
-        # MAX_STEPS was reached without the planner declaring completion.
-        # Never claim success in that situation.
-        return (
-            "I couldn't complete the entire command within the action limit."
-        )
+        _append_user_turn(text)
+        if route == "simple":
+            reply, resolved = _plan_loop(text, FAST_MODEL, FAST_MAX_STEPS, memory_context)
+            if resolved:
+                return reply
+            print(f"[router] fast tier ({FAST_MODEL}) did not finish — escalating to {MODEL}")
+        reply, _ = _plan_loop(text, MODEL, MAX_STEPS, memory_context)
+        return reply
 
 
 @app.post("/speak")
@@ -779,7 +894,7 @@ def status_endpoint():
 def health():
     try:
         models=client().list(); names=[getattr(m,"model",None) or getattr(m,"name",None) for m in models.models]
-        return {"status":"ok","ollama_host":OLLAMA_HOST,"model":MODEL,"model_installed":MODEL in names or any(n and n.startswith(MODEL.split(":")[0]) for n in names),"tools":sorted(TOOLS)}
+        return {"status":"ok","ollama_host":OLLAMA_HOST,"model":MODEL,"model_installed":MODEL in names or any(n and n.startswith(MODEL.split(":")[0]) for n in names),"fast_model":FAST_MODEL,"router_mode":ROUTER_MODE,"tools":sorted(TOOLS)}
     except Exception as exc: return {"status":"degraded","ollama_host":OLLAMA_HOST,"model":MODEL,"error":str(exc),"tools":sorted(TOOLS)}
 @app.get("/tools")
 def tools_endpoint(): return {"tools":sorted(TOOLS)}
