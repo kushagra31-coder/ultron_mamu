@@ -29,6 +29,7 @@ del _STT_DEVICE_PRE
 import queue
 import tempfile
 import threading
+import time
 import wave
 
 import numpy as np
@@ -117,13 +118,23 @@ def send_to_agent(text: str):
         print(f"[agent error] {e} (is agent_server.py running?)")
 
 
+_speaking_cache = {"value": False, "at": 0.0}
+_SPEAKING_CACHE_TTL = 0.5  # the wake-word loop asks ~12x/sec; cache it
+
+
 def is_agent_speaking() -> bool:
     """Returns True while the agent TTS is playing (used by wake word to avoid self-trigger)."""
     import requests as _req
+    now = time.monotonic()
+    if now - _speaking_cache["at"] < _SPEAKING_CACHE_TTL:
+        return _speaking_cache["value"]
     try:
-        return _req.get(AGENT_STATUS, timeout=0.15).json().get("speaking", False)
+        value = _req.get(AGENT_STATUS, timeout=0.15).json().get("speaking", False)
     except Exception:
-        return False
+        value = False
+    _speaking_cache["value"] = value
+    _speaking_cache["at"] = now
+    return value
 
 
 def toggle_recording():
@@ -181,6 +192,7 @@ if __name__ == "__main__":
     start_wake_word_listener(
         toggle_callback=toggle_recording,
         is_speaking_callback=is_agent_speaking,
+        is_recording_callback=lambda: recording,
     )
 
     # Start the hotkey listener in the background
