@@ -17,6 +17,12 @@ from tools.loader import load_tools
 from tools.registry import TOOLS, all_functions
 from tools.tts import speak_async, start_tts_worker, is_speaking
 
+try:
+    from memory import get_store  # always import-safe: chromadb loads lazily
+except Exception as exc:
+    print(f"[memory] import failed — long-term memory disabled: {exc}")
+    get_store = None
+
 MODEL=os.getenv("ULTRON_MODEL","qwen3.5:4b")
 OLLAMA_HOST=os.getenv("OLLAMA_HOST","http://127.0.0.1:11434")
 MAX_HISTORY=max(4,int(os.getenv("ULTRON_MAX_HISTORY","30")))
@@ -208,6 +214,10 @@ PERSONA & VOICE BEST PRACTICES (JARVIS-STYLE):
 - NEVER narrate your actions with filler phrases like "I will now search...", "I am opening...", or "Let me check...". Just execute the tool silently. The visual interface will show you are thinking.
 - Your ONLY spoken reply should be the final result, or a very brief confirmation (e.g. "Playing the song.", "The result is 52.", "Done.").
 - Avoid excessive "AI politeness" (e.g., "I am happy to help" or "I apologize"). It slows down the interaction.
+
+MEMORY:
+- Relevant long-term memories appear under RELEVANT MEMORIES. Use them to personalize your reply; never recite them unbidden.
+- When the user says "remember ...", call remember_fact immediately with the fact.
 
 You are an action-oriented computer assistant. Prefer completing the task over merely explaining how the user could do it."""
 app=FastAPI(title="Ultron Local Agent",version="1.0.0")
@@ -431,6 +441,15 @@ def run_agent(text: str) -> str:
         last_action_key_str = ""
         consecutive_action_count = 0
 
+        # Long-term memory: semantic recall of facts + past episodes,
+        # injected into every planning turn below.
+        memory_context = ""
+        if get_store is not None:
+            try:
+                memory_context = get_store().recall_block(text)
+            except Exception as exc:
+                print(f"[memory] recall failed: {exc}")
+
         # --------------------------------------------------
         # Multi-step planner/executor loop.
         #
@@ -472,6 +491,7 @@ def run_agent(text: str) -> str:
                     f"\n\nCURRENT TASK: {text}\n"
                     f"COMPLETED ACTIONS: {completed_actions}\n"
                     f"LAST ACTION: {last_action_display}"
+                    + (f"\n\n{memory_context}" if memory_context else "")
                 ),
             }]
 
@@ -743,7 +763,14 @@ def speak_endpoint(req: SpeakRequest):
     try: reply=run_agent(text)
     except ollama.ResponseError as exc: reply=f"Ollama error: {exc.error}. Check that Ollama is running and '{MODEL}' is installed."
     except Exception as exc: reply=f"I hit a local agent error: {exc}"
-    print(f"[agent] {reply}"); speak_async(reply); return {"reply":reply}
+    print(f"[agent] {reply}"); speak_async(reply)
+    # Episodic memory: log the turn (single funnel — covers all return paths).
+    if get_store is not None:
+        try:
+            get_store().add_episode(text, reply)
+        except Exception as exc:
+            print(f"[memory] store failed: {exc}")
+    return {"reply":reply}
 @app.get("/status")
 def status_endpoint():
     return {"speaking": is_speaking()}

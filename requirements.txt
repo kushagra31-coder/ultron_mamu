@@ -19,4 +19,5 @@ pyautogui==0.9.54
 scipy==1.16.3
 Pillow>=10.0.0,<13
 pywinauto==0.6.9
+chromadb>=0.6.0
 

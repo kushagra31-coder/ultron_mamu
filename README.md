@@ -56,6 +56,30 @@ The script also:
 
 Create another `.py` module under `tools/`, decorate a function with the `@tool(...)` registry decorator. `agent_server.py` does not need to be edited — `build_tool_context()` discovers it automatically from its signature and docstring on the next request.
 
+## Long-term memory
+
+Ultron remembers across restarts. A local ChromaDB vector store (CPU-only ONNX MiniLM embeddings, ~90MB downloaded once on first run — no API key, no GPU) keeps two collections:
+
+- **facts** — explicit long-lived facts ("remember my dog is Bruno"), saved via the `remember_fact` tool.
+- **episodes** — every conversation turn, stored automatically.
+
+Before planning, the agent semantically recalls relevant memories and injects them into the planner context. Tools: `remember_fact`, `recall_memory`, `forget_memory` — all auto-discovered like the rest.
+
+```
+pip install chromadb   # also added to requirements.txt
+```
+
+Env knobs:
+
+```
+$env:ULTRON_MEMORY_ENABLED="1"        # set "0" to disable
+$env:ULTRON_MEMORY_DIR="$HOME/.ultron/memory"
+$env:ULTRON_MEMORY_RECALL_K="5"
+$env:ULTRON_MEMORY_MAX_DISTANCE="1.0" # cosine-distance cutoff for recall
+```
+
+If `chromadb` isn't installed, memory degrades gracefully — the agent runs exactly as before, minus recall.
+
 ## Optional: Groq backend
 
 Set both to enable:
