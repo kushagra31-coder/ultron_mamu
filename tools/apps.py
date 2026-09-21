@@ -45,7 +45,15 @@ def notepad_write(text: str, save_path: str = "") -> str:
         return "pywinauto is not installed."
 
     try:
-        app = Application(backend="uia").start("notepad.exe")
+        # Win11 Notepad is single-instance: starting notepad.exe while it is
+        # already open just forwards to the existing window and the new
+        # process exits, leaving pywinauto attached to a dead handle.
+        # So prefer connecting to a live Notepad window; launch only if none.
+        try:
+            app = Application(backend="uia").connect(
+                title_re=".*Notepad.*", timeout=3)
+        except Exception:
+            app = Application(backend="uia").start("notepad.exe")
         dlg = app.window(title_re=".*Notepad.*")
         dlg.wait("ready", timeout=10)
         edit = dlg.child_window(control_type="Edit")
