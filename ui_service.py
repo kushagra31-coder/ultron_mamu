@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import math
 import os
-import random
 import requests
 import threading
 import tkinter as tk

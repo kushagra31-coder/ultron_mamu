@@ -242,7 +242,6 @@ def chat_reply_local(text: str) -> str:
         conversation.append({"role": "assistant", "content": reply or "(no reply)"})
     # NOTE: the /speak endpoint speaks the returned reply; do not speak here.
     return reply or "I'm not sure what to say to that."
-    return ""  # empty string signals caller to run full pipeline
 SYSTEM_PROMPT = f"""You are ULTRON, a local Windows voice assistant.
 Your home directory is {os.path.expanduser("~")}. When using absolute paths, use this directory.
 
