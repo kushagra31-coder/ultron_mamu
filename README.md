@@ -113,6 +113,7 @@ Leave `ULTRON_TALK_BACKEND` unset (default `local`) and none of this activates �
 | `ULTRON_ROUTER` | `local` | Two-tier routing. Set to `off` for single-model legacy behavior. |
 | `ULTRON_FAST_MAX_STEPS` | `8` | Step budget for the fast tier before escalating to 8B. |
 | `ULTRON_MAX_STEPS` | `30` | Step budget for the 8B planner. |
+| `ULTRON_AGENT_TIMEOUT` | `300` | Seconds the voice client waits for `/speak` (multi-step plans can take minutes). |
 | `ULTRON_STT_MODEL` | `small` | faster-whisper model (CPU). `medium` is more accurate; disk is cheap. |
 | `ULTRON_STT_DEVICE` | `cpu` | Set to `cuda` to move STT back to the GPU. |
 | `ULTRON_HA_URL` | `http://homeassistant.local:8123` | Home Assistant base URL. |
@@ -158,6 +159,6 @@ If `ULTRON_TALK_BACKEND=groq` is set, the raw text of every single utterance lea
 
 ## Known limits worth knowing before you rely on this
 
-- **No wall-clock timeout on the planner loop** — only a step count (`ULTRON_MAX_STEPS`). A confused model taking 30 slightly-different-but-still-wrong steps could take a long time before giving up.
+- **Planner stuck-breaker** — besides the step budget (`ULTRON_MAX_STEPS`), the loop aborts early if the model repeats rejected calls: 3 identical rejections in a row, or 8 rejections total in one turn (catches alternating-argument loops). It replies asking you to break the request into smaller steps instead of burning all 30 steps.
 - **GUI automation is a mix of deterministic UIAutomation** (e.g. `read_calculator_display`) where a dedicated tool exists, and vision/screenshot-based `capture_screen` as the general fallback elsewhere — the former is faster and more reliable; prefer building dedicated UIAutomation tools for any app you use often.
 - **Tool control (file access, app launching, GUI input) is Windows-specific throughout** (`pywinauto`) — not portable to macOS/Linux without rewriting that layer.
