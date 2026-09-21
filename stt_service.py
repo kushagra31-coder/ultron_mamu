@@ -107,7 +107,10 @@ def send_to_agent(text: str):
         return
     import requests
     try:
-        resp = requests.post(AGENT_ENDPOINT, json={"text": text}, timeout=60)
+        # Multi-step plans can legitimately take minutes; default the
+        # client timeout high and allow override via ULTRON_AGENT_TIMEOUT.
+        agent_timeout = float(os.getenv("ULTRON_AGENT_TIMEOUT", "300"))
+        resp = requests.post(AGENT_ENDPOINT, json={"text": text}, timeout=agent_timeout)
         data = resp.json()
         print(f"[agent] {data.get('reply', data)}")
     except Exception as e:

@@ -269,7 +269,7 @@ FILES:
 - Use filesystem tools for user-requested file operations.
 - Do not invent file contents or claim a file was changed unless the tool confirms it.
 - Use find_files to search for local files on the computer. Do NOT use web_search for finding local files.
-- If a tool is REJECTED due to a consecutive limit, STOP calling it and try a completely different approach.
+- If a tool call is REJECTED for any reason, you MUST call a different tool with different arguments on your next turn. Repeating a rejected call will abort the task.
 
 VISION / SCREEN OBSERVATION:
 - Use capture_screen ONCE per observation. After it returns a description, immediately put your spoken reply in the 'reply' field and set 'calls' to [].
@@ -525,6 +525,8 @@ def _plan_loop(text: str, model: str, max_steps: int, memory_context: str = "") 
     # Track consecutive duplicates to break loops
     last_action_key_str = ""
     consecutive_action_count = 0
+    consecutive_rejections = 0  # same rejected call repeated back-to-back
+    total_rejections = 0        # any rejections this run — catches alternating-arg loops
 
     # --------------------------------------------------
     # Multi-step planner/executor loop.
@@ -781,9 +783,21 @@ def _plan_loop(text: str, model: str, max_steps: int, memory_context: str = "") 
                     f"{time.perf_counter() - tool_start:.2f}s"
                 )
                 action_history.append(f"{name} [already done]")
+                consecutive_rejections += 1
+                total_rejections += 1
+                if consecutive_rejections >= 3 or total_rejections >= 8:
+                    print(f"[plan] aborting: planner stuck on rejected calls "
+                          f"(consecutive={consecutive_rejections}, total={total_rejections})")
+                    conversation.append({
+                        "role": "assistant",
+                        "content": "[planner stuck repeating rejected calls — aborting]",
+                    })
+                    return ("I got stuck on that request — could you break it "
+                            "into smaller steps and try again?"), False
                 
             else:
                 result = execute(call)
+                consecutive_rejections = 0  # planner made progress — reset stuck counter
                 print(f"[tool] {name}: {result}")
                 
                 print(
