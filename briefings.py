@@ -45,10 +45,6 @@ def get_reminders() -> list[dict]:
         return []
 
 
-def _today_str() -> str:
-    return _dt.date.today().isoformat()
-
-
 def todays_reminders(now: _dt.datetime | None = None) -> list[dict]:
     """Reminders relevant today, sorted by time. Dated entries must match
     today; dateless entries repeat daily."""
