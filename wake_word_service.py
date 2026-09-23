@@ -60,6 +60,7 @@ def _resolve_model_path(name_or_path: str) -> str | None:
 def start_wake_word_listener(
     toggle_callback: Callable[[], None],
     is_speaking_callback: Callable[[], bool],
+    is_recording_callback: Callable[[], bool] = lambda: False,
 ) -> None:
     """
     Start the always-on wake word listener in a background daemon thread.
@@ -69,6 +70,9 @@ def start_wake_word_listener(
                             the hotkey calls to start recording.
         is_speaking_callback: Returns True while TTS is playing; detection
                             is paused during this window.
+        is_recording_callback: Returns True while the mic is recording; detection
+                            is paused during this window so a re-trigger can't
+                            toggle recording back off mid-sentence.
     """
     try:
         from openwakeword.model import Model as _OWWModel
@@ -106,11 +110,16 @@ def start_wake_word_listener(
             dtype="float32",
             callback=_audio_cb,
         ):
+            cooldown_until = 0.0
             while True:
                 chunk = audio_q.get()
+                now = time.monotonic()
 
-                # Pause detection while TTS is speaking
-                if is_speaking_callback():
+                # Pause detection while TTS is speaking OR while recording —
+                # a detection during recording would toggle recording OFF.
+                if is_speaking_callback() or is_recording_callback():
+                    continue
+                if now < cooldown_until:
                     continue
 
                 # openWakeWord expects int16 PCM
@@ -122,8 +131,14 @@ def start_wake_word_listener(
                     print(f"[wake] Detected! score={score:.3f} — activating Ultron")
                     oww.reset()   # clear state so it won't re-trigger immediately
                     toggle_callback()
-                    # Brief cooldown so it doesn't double-fire
-                    time.sleep(1.5)
+                    # Drain queued audio (the tail of the "hey jarvis"
+                    # utterance) so it can't immediately re-trigger.
+                    while not audio_q.empty():
+                        try:
+                            audio_q.get_nowait()
+                        except queue.Empty:
+                            break
+                    cooldown_until = time.monotonic() + 2.0
 
     t = threading.Thread(target=_listener, name="ultron-wake", daemon=True)
     t.start()
