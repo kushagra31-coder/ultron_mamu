@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 from tools.loader import load_tools
 from tools.registry import TOOLS, all_functions
 from tools.tts import speak_async, start_tts_worker, is_speaking
+from tools.early_commit import handle_partial, pop_session_note, try_undo_full_text
 
 try:
     from memory import get_store  # always import-safe: chromadb loads lazily
@@ -315,7 +316,8 @@ You are an action-oriented computer assistant. Prefer completing the task over m
 app=FastAPI(title="Ultron Local Agent",version="1.0.0")
 lock=threading.Lock()
 conversation=[{"role":"system","content":SYSTEM_PROMPT}]
-class SpeakRequest(BaseModel): text: str
+class SpeakRequest(BaseModel): text: str; session_id: str = ""
+class PartialRequest(BaseModel): text: str; session_id: str = ""; seq: int = 0
 
 def client(): return ollama.Client(host=OLLAMA_HOST)
 def compact(x: Any)->str:
@@ -839,8 +841,25 @@ def _plan_loop(text: str, model: str, max_steps: int, memory_context: str = "") 
 
 
 
-def run_agent(text: str) -> str:
+def run_agent(text: str, session_id: str = "") -> str:
     global conversation
+
+    # Voice correction as a full utterance ("no", "never mind", "undo"):
+    # reverse the last early-committed action instead of planning anything.
+    undone = try_undo_full_text(text)
+    if undone:
+        return "Undone."
+
+    # Jev-style early commit: the STT service may already have executed a
+    # confident closed-set command from a partial transcript. Tell the
+    # planner so it never repeats it — it continues with the remainder.
+    early_note = pop_session_note(session_id)
+    if early_note:
+        text = (
+            f"{text}\n\n[Already executed while you were still speaking — "
+            f"do NOT repeat it: {early_note}. "
+            f"Continue with any remaining part of the request.]"
+        )
 
     # Long-term memory: semantic recall of facts + past episodes.
     # Recalled once per turn and shared by both planner tiers.
@@ -888,7 +907,7 @@ def speak_endpoint(req: SpeakRequest):
     text=req.text.strip()
     if not text: reply="I didn't catch anything."; speak_async(reply); return {"reply":reply}
     print(f"[you said] {text}")
-    try: reply=run_agent(text)
+    try: reply=run_agent(text, session_id=req.session_id)
     except ollama.ResponseError as exc: reply=f"Ollama error: {exc.error}. Check that Ollama is running and '{MODEL}' is installed."
     except Exception as exc: reply=f"I hit a local agent error: {exc}"
     print(f"[agent] {reply}"); speak_async(reply)
@@ -899,6 +918,13 @@ def speak_endpoint(req: SpeakRequest):
         except Exception as exc:
             print(f"[memory] store failed: {exc}")
     return {"reply":reply}
+
+@app.post("/partial")
+def partial_endpoint(req: PartialRequest):
+    """Streaming gate for early-commit: evaluates one partial transcript
+    from the STT service and (maybe) executes a confident closed-set
+    command immediately. Fire-and-forget from the caller's side."""
+    return handle_partial(req.text, req.session_id, req.seq)
 @app.get("/status")
 def status_endpoint():
     return {"speaking": is_speaking()}

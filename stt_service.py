@@ -30,6 +30,7 @@ import queue
 import tempfile
 import threading
 import time
+import uuid
 import wave
 
 import numpy as np
@@ -66,6 +67,22 @@ frames = []
 audio_q = queue.Queue()
 current_keys = set()
 
+# ---- Early-commit: stream partial transcripts while recording ------------
+# Every PARTIAL_INTERVAL seconds the tail of the captured audio is
+# transcribed (fast settings, no extra model/VRAM) and POSTed to the
+# agent's /partial gate, which may execute a confident closed-set command
+# BEFORE the user finishes speaking. Set ULTRON_EARLY_COMMIT=0 to disable.
+EARLY_COMMIT     = os.getenv("ULTRON_EARLY_COMMIT", "1").strip() != "0"
+PARTIAL_INTERVAL = float(os.getenv("ULTRON_PARTIAL_INTERVAL", "1.5"))
+PARTIAL_WINDOW   = float(os.getenv("ULTRON_PARTIAL_WINDOW", "8"))
+PARTIAL_ENDPOINT = "http://localhost:8000/partial"
+
+_model_lock   = threading.Lock()  # faster-whisper: one transcription at a time
+_session_id   = ""
+_partial_seq  = 0
+_partial_last = ""
+_partial_stop = threading.Event()
+
 
 def audio_callback(indata, frames_count, time_info, status):
     if status:
@@ -97,12 +114,79 @@ def save_wav(path, audio_frames):
 def transcribe(path):
     # language="en" forces English and reduces translation hallucinations.
     # condition_on_previous_text=False prevents it from inventing text out of background noise.
-    segments, info = model.transcribe(path, beam_size=5, language="en", condition_on_previous_text=False)
-    text = " ".join(seg.text.strip() for seg in segments)
+    with _model_lock:
+        segments, info = model.transcribe(path, beam_size=5, language="en", condition_on_previous_text=False)
+        text = " ".join(seg.text.strip() for seg in segments)
     return text.strip()
 
 
-def send_to_agent(text: str):
+def _transcribe_audio_fast(audio):
+    """Transcribe an in-memory audio chunk with fast settings (beam_size=1).
+    Non-blocking: returns "" if the model is busy with the final transcription,
+    so partials can never slow down or disturb the recording."""
+    if not _model_lock.acquire(blocking=False):
+        return ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        with wave.open(tmp_path, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_int16.tobytes())
+        segments, _info = model.transcribe(tmp_path, beam_size=1, language="en", condition_on_previous_text=False)
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        os.remove(tmp_path)
+        return text
+    except Exception as exc:
+        print(f"[partial] transcription failed: {exc}")
+        return ""
+    finally:
+        _model_lock.release()
+
+
+def _post_partial(text, session_id, seq):
+    import requests as _req
+    try:
+        _req.post(PARTIAL_ENDPOINT,
+                  json={"text": text, "session_id": session_id, "seq": seq},
+                  timeout=0.6)
+    except Exception:
+        pass  # fire-and-forget: never disturb the recording
+
+
+def _partial_loop():
+    """While recording, transcribe the tail of the captured audio every
+    PARTIAL_INTERVAL seconds and stream it to the agent's /partial gate."""
+    global _partial_seq, _partial_last
+    while recording and not _partial_stop.is_set():
+        time.sleep(PARTIAL_INTERVAL)
+        if not recording or _partial_stop.is_set():
+            break
+        snapshot = list(frames)
+        if not snapshot:
+            continue
+        try:
+            audio = np.concatenate(snapshot, axis=0).flatten()
+        except Exception:
+            continue
+        max_samples = int(SAMPLE_RATE * PARTIAL_WINDOW)
+        if len(audio) > max_samples:
+            audio = audio[-max_samples:]
+        if len(audio) < int(SAMPLE_RATE * 0.8):
+            continue
+        text = _transcribe_audio_fast(audio)
+        if not text or text == _partial_last:
+            continue
+        _partial_last = text
+        _partial_seq += 1
+        threading.Thread(target=_post_partial,
+                         args=(text, _session_id, _partial_seq),
+                         daemon=True).start()
+
+
+def send_to_agent(text: str, session_id: str = ""):
     print(f"[you said] {text}")
     if not AGENT_ENDPOINT:
         return
@@ -111,7 +195,7 @@ def send_to_agent(text: str):
         # Multi-step plans can legitimately take minutes; default the
         # client timeout high and allow override via ULTRON_AGENT_TIMEOUT.
         agent_timeout = float(os.getenv("ULTRON_AGENT_TIMEOUT", "300"))
-        resp = requests.post(AGENT_ENDPOINT, json={"text": text}, timeout=agent_timeout)
+        resp = requests.post(AGENT_ENDPOINT, json={"text": text, "session_id": session_id}, timeout=agent_timeout)
         data = resp.json()
         print(f"[agent] {data.get('reply', data)}")
     except Exception as e:
@@ -138,28 +222,36 @@ def is_agent_speaking() -> bool:
 
 
 def toggle_recording():
-    global recording, frames
+    global recording, frames, _session_id, _partial_seq, _partial_last
     if not recording:
         print("\n🎙️  Recording... (press hotkey again to stop)")
         frames = []
+        _session_id = uuid.uuid4().hex
+        _partial_seq = 0
+        _partial_last = ""
+        _partial_stop.clear()
         recording = True
+        if EARLY_COMMIT:
+            threading.Thread(target=_partial_loop, daemon=True).start()
     else:
         recording = False
+        _partial_stop.set()
         print("⏹️  Stopped. Transcribing...")
         if not frames:
             print("(no audio captured)")
             return
         captured_frames = list(frames)
-        threading.Thread(target=_process_audio, args=(captured_frames,), daemon=True).start()
+        session_id = _session_id
+        threading.Thread(target=_process_audio, args=(captured_frames, session_id), daemon=True).start()
 
-def _process_audio(captured_frames):
+def _process_audio(captured_frames, session_id=""):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     save_wav(tmp_path, captured_frames)
     text = transcribe(tmp_path)
     os.remove(tmp_path)
     if text:
-        send_to_agent(text)
+        send_to_agent(text, session_id)
     else:
         print("(nothing transcribed)")
 
